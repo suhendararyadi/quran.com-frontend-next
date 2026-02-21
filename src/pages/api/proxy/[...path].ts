@@ -3,15 +3,6 @@ import { EventEmitter } from 'events';
 import { createProxyMiddleware, fixRequestBody } from 'http-proxy-middleware';
 import { NextApiRequest, NextApiResponse } from 'next';
 
-import generateSignature from '@/utils/auth/signature';
-import {
-  X_AUTH_SIGNATURE,
-  X_INTERNAL_CLIENT,
-  X_TIMESTAMP,
-  X_PROXY_SIGNATURE,
-  X_PROXY_TIMESTAMP,
-} from '@/utils/headers';
-
 const ERROR_MESSAGES = {
   PROXY_ERROR: 'Proxy error',
   PROXY_HANDLER_ERROR: 'Proxy handler error',
@@ -22,118 +13,95 @@ const ALLOWED_DOMAINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((domain) => domain.trim());
 
-// This line increases the default maximum number of event listeners for the EventEmitter to a better number like 20.
-// It is necessary to prevent memory leak warnings when multiple listeners are added,
-// which can occur in a proxy setup like this where multiple requests are handled concurrently.
 EventEmitter.defaultMaxListeners = Number(process.env.PROXY_DEFAULT_MAX_LISTENERS) || 100;
 
 const isOriginAllowed = (origin: string | undefined): boolean => {
-  if (!origin) return false;
-  const url = new URL(origin);
-  const { hostname } = url;
-  return ALLOWED_DOMAINS.includes(hostname);
-};
-
-const handleProxyReq = (proxyReq, req, res) => {
-  const origin = req.headers.origin || req.headers.referer || '';
-  if (origin) {
-    if (!isOriginAllowed(origin)) {
-      res.status(403).send({ error: ERROR_MESSAGES.FORBIDDEN });
-      return;
-    }
-  } else if (!verifySignature(req, res)) {
-    return;
-  }
-
-  attachCookies(proxyReq, req);
-  attachSignatureHeaders(proxyReq, req);
-  fixRequestBody(proxyReq, req);
-};
-
-const verifySignature = (req, res) => {
-  const protocol = req.headers['x-forwarded-proto'] || 'http';
-  const requestUrl = `${protocol}://${req.headers.host}/api/proxy${req.url}`;
-  const timestampHeader = req.headers[X_PROXY_TIMESTAMP] as string;
-  const { signature } = generateSignature(
-    req,
-    requestUrl,
-    process.env.PROXY_SIGNATURE_TOKEN as string,
-    timestampHeader,
-  );
-
-  if (req.headers[X_PROXY_SIGNATURE] !== signature) {
-    res.status(403).send({ error: ERROR_MESSAGES.FORBIDDEN });
+  if (!origin) return true; // Allow server-side requests (no origin)
+  try {
+    const url = new URL(origin);
+    const { hostname } = url;
+    return ALLOWED_DOMAINS.includes(hostname);
+  } catch {
     return false;
   }
-  return true;
 };
 
-const attachCookies = (proxyReq, req) => {
-  if (req.headers.cookie) {
-    proxyReq.setHeader('Cookie', req.headers.cookie);
-  }
+// Map service names to their public API hosts
+const SERVICE_HOSTS: Record<string, string> = {
+  content:
+    process.env.NEXT_PUBLIC_VERCEL_ENV === 'production'
+      ? 'https://api.qurancdn.com'
+      : 'https://staging.quran.com',
+  auth:
+    process.env.NEXT_PUBLIC_VERCEL_ENV === 'production'
+      ? 'https://api.qurancdn.com'
+      : 'https://staging.quran.com',
+  search:
+    process.env.NEXT_PUBLIC_VERCEL_ENV === 'production'
+      ? 'https://api.qurancdn.com'
+      : 'https://staging.quran.com',
 };
 
-const attachSignatureHeaders = (proxyReq, req) => {
-  const requestUrl = `${process.env.API_GATEWAY_URL}${req.url}`;
-  const { signature, timestamp } = generateSignature(
-    req,
-    requestUrl,
-    process.env.SIGNATURE_TOKEN as string,
-  );
-
-  proxyReq.setHeader(X_AUTH_SIGNATURE, signature);
-  proxyReq.setHeader(X_TIMESTAMP, timestamp);
-  proxyReq.setHeader(X_INTERNAL_CLIENT, process.env.INTERNAL_CLIENT_ID);
-};
+const DEFAULT_HOST =
+  process.env.NEXT_PUBLIC_VERCEL_ENV === 'production'
+    ? 'https://api.qurancdn.com'
+    : 'https://staging.quran.com';
 
 const apiProxy = createProxyMiddleware<NextApiRequest, NextApiResponse>({
-  target: process.env.API_GATEWAY_URL,
+  target: DEFAULT_HOST,
   changeOrigin: true,
-  pathRewrite: { '^/api/proxy': '' }, // eslint-disable-line @typescript-eslint/naming-convention
-  secure: process.env.NEXT_PUBLIC_VERCEL_ENV === 'production', // Disable SSL verification to avoid UNABLE_TO_VERIFY_LEAF_SIGNATURE error for dev
+  // Strip /api/proxy/{service} prefix, keeping the rest of the path
+  pathRewrite: (path) => {
+    // /api/proxy/content/api/qdc/chapters -> /api/qdc/chapters
+    // /api/proxy/auth/courses -> /courses
+    // /api/proxy/search/v1/search -> /v1/search
+    return path.replace(/^\/api\/proxy\/[^/]+/, '');
+  },
+  router: (req) => {
+    // Route to different hosts based on service name
+    const match = req.url?.match(/^\/api\/proxy\/([^/]+)/);
+    const service = match ? match[1] : 'content';
+    return SERVICE_HOSTS[service] || DEFAULT_HOST;
+  },
+  secure: process.env.NEXT_PUBLIC_VERCEL_ENV === 'production',
   logger: console,
 
   on: {
-    proxyReq: handleProxyReq,
+    proxyReq: (proxyReq, req, res) => {
+      const origin = req.headers.origin || req.headers.referer || '';
+      if (origin && !isOriginAllowed(origin)) {
+        (res as NextApiResponse).status(403).send({ error: ERROR_MESSAGES.FORBIDDEN });
+        return;
+      }
+
+      // Attach cookies if present
+      if (req.headers.cookie) {
+        proxyReq.setHeader('Cookie', req.headers.cookie);
+      }
+
+      fixRequestBody(proxyReq, req);
+    },
 
     proxyRes: (proxyRes, req, res) => {
-      // Set cookies from the proxy response to the original response
       const proxyCookies = proxyRes.headers['set-cookie'];
       if (proxyCookies) {
         res.setHeader('Set-Cookie', proxyCookies);
       }
-
-      // Prevent intermediate proxy caching (Traefik, nginx, etc.)
-      // This ensures fresh data flows through from the API Gateway's CF cache
-      // Note: This does NOT affect CF caching at the API Gateway level
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
     },
 
     error: (err, req, res) => {
-      // BUGFIX: The original code was calling res.end() with a function that returns an object:
-      // res.end(() => ({ error: ERROR_MESSAGES.PROXY_ERROR, message: err.message }))
-      //
-      // This caused a TypeError because res.end() expects a string, Buffer, or ArrayBuffer,
-      // not a function. The function was being passed as the response body, which caused:
-      // "The 'string' argument must be of type string... Received type function"
-      //
-      // The fix is to properly send JSON responses based on the response object type:
-
-      // Check if res is a NextApiResponse (has status method) or a Socket
       if ('status' in res && typeof res.status === 'function') {
         res.status(500).json({ error: ERROR_MESSAGES.PROXY_ERROR, message: err.message });
       } else {
-        // For Socket or other types, just end the response with a stringified error
         res.end(JSON.stringify({ error: ERROR_MESSAGES.PROXY_ERROR, message: err.message }));
       }
     },
   },
 });
 
-// Maximum request body size for API routes, aligned with backend limit for profile picture uploads
 const API_BODY_SIZE_LIMIT = process.env.API_BODY_SIZE_LIMIT || '8mb';
 
 export const config = {
