@@ -106,6 +106,7 @@ const API_BODY_SIZE_LIMIT = process.env.API_BODY_SIZE_LIMIT || '8mb';
 
 export const config = {
   api: {
+    externalResolver: true,
     bodyParser: {
       sizeLimit: API_BODY_SIZE_LIMIT,
     },

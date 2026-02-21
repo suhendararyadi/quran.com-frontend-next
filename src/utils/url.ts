@@ -1,5 +1,3 @@
-import { isStaticBuild } from '@/utils/build';
-
 const getLocalePostfix = (locale: string) => (locale !== 'en' ? `/${locale}` : '');
 
 export enum QuranFoundationService {
@@ -69,8 +67,9 @@ export const getBasePath = (): string =>
 
 export const getProxiedServiceUrl = (service: QuranFoundationService, path: string): string => {
   const PROXY_PATH = `/api/proxy/${service}`;
-  if (isStaticBuild) {
-    // During build time, call the public API directly (no auth required)
+  if (typeof window === 'undefined') {
+    // During server-side execution (build time or ISR), call the public API directly
+    // to avoid self-referencing requests through the Vercel CDN proxy
     const API_HOST =
       process.env.NEXT_PUBLIC_VERCEL_ENV === 'production'
         ? 'https://api.qurancdn.com'
