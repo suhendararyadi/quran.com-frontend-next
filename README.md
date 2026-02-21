@@ -57,7 +57,7 @@ The app runs on Next.js and will automatically hot reload when you make changes.
 
 ### Environment Variables
 
-Rename the `env.example` file to `env.local`.
+Rename the `.env.example` file to `.env.local`.
 
 ### DLS (Design Language System)
 
